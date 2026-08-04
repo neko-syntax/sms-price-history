@@ -1,0 +1,6 @@
+node_modules/
+
+# Log/tạm thời khác (phòng sẵn, không bắt buộc dùng)
+npm-debug.log*
+.env
+.DS_Store

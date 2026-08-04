@@ -1,0 +1,22 @@
+{
+  "name": "binance-historical-price-server",
+  "version": "1.0.0",
+  "description": "Server Node.js lấy giá lịch sử Binance theo khung thời gian, tích hợp RAM Cache và HTTP API cho App Flutter",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "binance",
+    "crypto",
+    "historical-price",
+    "render",
+    "cache"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.0"
+  }
+}
