@@ -109,7 +109,7 @@ async function loadSymbolList() {
 // ==========================================
 // 3. LẤY NHIỀU NẾN 1M CHO 1 SYMBOL (1 REQUEST DUY NHẤT, đủ phủ mọi khung)
 // ==========================================
-async function fetchCandlesForSymbol(symbol) {
+async function fetchCandlesForSymbol(symbol, failures) {
   try {
     const response = await axios.get(FUT_KLINES_URL, {
       params: { symbol, interval: '1m', limit: CANDLE_LIMIT },
@@ -118,8 +118,22 @@ async function fetchCandlesForSymbol(symbol) {
     if (Array.isArray(response.data) && response.data.length > 0) {
       return response.data;
     }
+    // ĐÃ SỬA (người dùng yêu cầu: "dù lý do gì cũng phải log"): TRƯỚC ĐÂY
+    // response rỗng/không đúng dạng bị nuốt HOÀN TOÀN im lặng, coi như lỗi
+    // mạng bình thường - giờ ghi lại lý do CỤ THỂ vào mảng `failures` (dùng
+    // chung 1 chỗ với nhánh catch bên dưới) - `refreshAllCandles()` sẽ tự
+    // log tóm tắt cuối chu kỳ, không cần log riêng ở đây (tránh ngập log với
+    // 450 symbol).
+    if (failures) failures.push({ symbol, reason: 'empty_response' });
     return null;
   } catch (error) {
+    if (failures) {
+      // Phân biệt rõ 429/418 (rate-limit/ban - ĐÁNG LO, cần biết ngay) với
+      // lỗi mạng/timeout thường (symbol lẻ tẻ, không đáng lo).
+      const status = error.response?.status;
+      const reason = status ? `HTTP_${status}` : error.code || error.message || 'unknown';
+      failures.push({ symbol, reason });
+    }
     return null;
   }
 }
@@ -132,19 +146,18 @@ function sleep(ms) {
 }
 
 async function refreshAllCandles() {
-  if (cycleInProgress) return;
+  if (cycleInProgress) {
+    // ĐÃ SỬA (người dùng chỉ ra: guard này TRƯỚC ĐÂY 100% câm lặng): log rõ
+    // thay vì im lặng - nếu dòng này lặp lại NHIỀU lần liên tiếp (mỗi 90s),
+    // nghĩa là chu kỳ trước đang bị TREO (xem watchdog bên dưới - dù treo
+    // thật thì cũng chỉ tối đa vài lần trước khi watchdog tự cắt).
+    const stuckMs = lastCycleStartedAt ? Date.now() - lastCycleStartedAt : null;
+    console.warn(
+      `[Cycle] Chu kỳ trước vẫn đang chạy (bắt đầu ${stuckMs}ms trước) - bỏ qua lần gọi này.`
+    );
+    return;
+  }
 
-  // BUG ĐÃ SỬA (người dùng phát hiện qua log thật): TRƯỚC ĐÂY nếu
-  // `symbolList` rỗng (VD lỗi lúc khởi động - 418 do dính rate-limit/ban
-  // tạm thời từ Binance ngay lúc server vừa lên) thì hàm này ÂM THẦM
-  // `return` ở đây MÃI MÃI - dù `setInterval` vẫn gọi lại đều đặn mỗi 90s,
-  // không có lấy 1 dòng log, KHÔNG CÓ CƠ CHẾ THỬ LẠI nào cả - server sống
-  // (Express vẫn chạy) nhưng phần lấy giá coi như CHẾT HẲN tới khi có người
-  // tự khởi động lại server. Giờ THỬ TẢI LẠI danh sách symbol NGAY TẠI ĐÂY
-  // mỗi khi thấy rỗng - vì hàm này vốn đã được gọi lại đều đặn mỗi 90s qua
-  // `setInterval`, tự nhiên có được nhịp thử lại KHÔNG CẦN thêm cơ chế
-  // backoff riêng (90s giữa các lần thử là đủ giãn cách, không tính là dồn
-  // dập lên Binance - chỉ 2 request nhẹ/lần thử, không phải hàng trăm).
   if (symbolList.length === 0) {
     try {
       symbolList = await loadSymbolList();
@@ -159,31 +172,97 @@ async function refreshAllCandles() {
   cycleInProgress = true;
   lastCycleStartedAt = Date.now();
 
-  for (let i = 0; i < symbolList.length; i += BATCH_SIZE) {
-    const batch = symbolList.slice(i, i + BATCH_SIZE);
-    await Promise.all(
-      batch.map(async (symbol) => {
-        const candles = await fetchCandlesForSymbol(symbol);
-        // Cập nhật cache NGAY khi symbol này xong - không đợi cả lô/cả chu
-        // kỳ hoàn tất - symbol nào xong sớm thì có dữ liệu mới sớm.
-        if (candles) {
-          candleCache.set(symbol, { timestamp: Date.now(), candles });
-        }
-        // Lỗi 1 symbol (mạng/429/delist giữa chừng) -> GIỮ NGUYÊN cache CŨ
-        // của symbol đó (nếu có) thay vì xoá - "dữ liệu hơi cũ" luôn tốt
-        // hơn "không có gì", app vẫn tự fallback Binance nếu thấy thiếu.
-      })
-    );
-    if (i + BATCH_SIZE < symbolList.length) await sleep(BATCH_DELAY_MS);
-  }
+  // MỚI - WATCHDOG CHO CẢ CHU KỲ (khắc phục bug "câm lặng, không lấy được
+  // data" người dùng phát hiện): TRƯỚC ĐÂY không có giới hạn thời gian nào
+  // cho toàn bộ vòng lặp lấy nến - chỉ TỪNG request riêng có `timeout: 8000`
+  // (bên trong `fetchCandlesForSymbol`). Nhưng `timeout` của axios KHÔNG
+  // đảm bảo kích hoạt 100% mọi tình huống (có ca hiếm treo ở tầng TCP/DNS mà
+  // timeout không bắt được - vấn đề đã biết của axios/Node, không phải suy
+  // đoán). Chỉ cần ĐÚNG 1 trong hàng trăm request rơi vào ca đó:
+  // `Promise.all()` của lô đó đứng hình VĨNH VIỄN -> `cycleInProgress`
+  // không bao giờ về lại `false` -> KHÔNG throw, KHÔNG catch được, KHÔNG
+  // log gì cả (không lỗi, chỉ treo im lặng) -> mọi lần gọi `setInterval` sau
+  // đó bị chặn âm thầm MÃI MÃI qua guard ở đầu hàm. `Promise.race` với 1
+  // watchdog timeout CỨNG cho CẢ CHU KỲ đảm bảo dù có request nào treo kiểu
+  // gì, hàm này CHẮC CHẮN thoát ra được (qua `finally`), log rõ lý do, và
+  // chu kỳ 90s SAU vẫn được thử lại bình thường - không bao giờ kẹt vĩnh
+  // viễn nữa.
+  const CYCLE_WATCHDOG_MS = 60 * 1000; // rộng hơn nhiều so với ~10-15s bình thường
+  // Đếm lỗi từng symbol để LOG TÓM TẮT cuối chu kỳ (người dùng yêu cầu:
+  // "dù lý do gì cũng phải log" - nhưng log riêng lẻ từng symbol lỗi trong
+  // 450 symbol sẽ ngập log vô ích, nên gom lại thành 1 dòng tóm tắt).
+  const failures = [];
 
-  lastCycleFinishedAt = Date.now();
-  cycleInProgress = false;
-  console.log(
-    `[Cycle] Xong - ${candleCache.size}/${symbolList.length} symbol có cache, mất ${
-      lastCycleFinishedAt - lastCycleStartedAt
-    }ms`
-  );
+  try {
+    await Promise.race([
+      (async () => {
+        for (let i = 0; i < symbolList.length; i += BATCH_SIZE) {
+          const batch = symbolList.slice(i, i + BATCH_SIZE);
+          await Promise.all(
+            batch.map(async (symbol) => {
+              const candles = await fetchCandlesForSymbol(symbol, failures);
+              // Cập nhật cache NGAY khi symbol này xong - không đợi cả lô/cả
+              // chu kỳ hoàn tất - symbol nào xong sớm thì có dữ liệu mới sớm.
+              if (candles) {
+                candleCache.set(symbol, { timestamp: Date.now(), candles });
+              }
+              // Lỗi 1 symbol (mạng/429/delist giữa chừng) -> GIỮ NGUYÊN cache
+              // CŨ của symbol đó (nếu có) thay vì xoá - "dữ liệu hơi cũ" luôn
+              // tốt hơn "không có gì", app vẫn tự fallback Binance nếu thiếu.
+            })
+          );
+          if (i + BATCH_SIZE < symbolList.length) await sleep(BATCH_DELAY_MS);
+        }
+      })(),
+      sleep(CYCLE_WATCHDOG_MS).then(() => {
+        throw new Error(`CYCLE_WATCHDOG_TIMEOUT sau ${CYCLE_WATCHDOG_MS}ms - có request treo bất thường`);
+      }),
+    ]);
+
+    lastCycleFinishedAt = Date.now();
+    // MỚI: log tóm tắt lỗi (nếu có) NGAY TRONG dòng log hoàn tất - đúng yêu
+    // cầu "dù lý do gì cũng phải log" mà không ngập log 450 dòng riêng lẻ.
+    const failSummary =
+      failures.length === 0
+        ? ''
+        : ` | ${failures.length} symbol lỗi (VD: ${failures
+            .slice(0, 5)
+            .map((f) => `${f.symbol}:${f.reason}`)
+            .join(', ')}${failures.length > 5 ? '...' : ''})`;
+    console.log(
+      `[Cycle] Xong - ${candleCache.size}/${symbolList.length} symbol có cache, mất ${
+        lastCycleFinishedAt - lastCycleStartedAt
+      }ms${failSummary}`
+    );
+
+    // MỚI: cảnh báo RIÊNG, NỔI BẬT nếu nghi ngờ bị Binance rate-limit/ban
+    // DIỆN RỘNG (429/418 chiếm phần lớn số lỗi) - đúng kịch bản đã từng gây
+    // bug "câm lặng" trước đây (lúc đó xảy ra ngay lúc start nên có log
+    // riêng; giờ thêm để bắt được cả khi nó xảy ra GIỮA CHỪNG lúc server đã
+    // chạy lâu, trước đây hoàn toàn không có cảnh báo nào cho ca này).
+    const banLikeCount = failures.filter(
+      (f) => f.reason === 'HTTP_429' || f.reason === 'HTTP_418'
+    ).length;
+    if (banLikeCount >= 20) {
+      console.warn(
+        `[Cycle] ⚠ NGHI NGỜ ĐANG BỊ BINANCE RATE-LIMIT/BAN DIỆN RỘNG - ${banLikeCount}/${symbolList.length} symbol trả 429/418 trong chu kỳ này. Nếu lặp lại nhiều chu kỳ liên tiếp, cân nhắc tăng BATCH_DELAY_MS hoặc giảm BATCH_SIZE.`
+      );
+    }
+  } catch (e) {
+    // Watchdog cắt ngang (hoặc lỗi thật sự chưa lường trước) - LUÔN log rõ,
+    // không để im lặng như trước. LƯU Ý: watchdog KHÔNG hủy được request
+    // đang treo thật sự (Node không có cách "giết" 1 Promise đang chờ) -
+    // request đó vẫn tự chạy ngầm rồi tự kết thúc sau, nhưng quan trọng nhất
+    // là chu kỳ SAU không còn bị nó chặn nữa (nhờ `finally` bên dưới).
+    console.error(
+      `[Cycle] LỖI/TREO giữa chừng: ${e.message} - đã có ${candleCache.size}/${symbolList.length} symbol trong cache trước đó (giữ nguyên).`
+    );
+  } finally {
+    // LUÔN reset - dù thành công, lỗi, hay bị watchdog buộc dừng - để chu
+    // kỳ SAU (90s tới, qua setInterval) CHẮC CHẮN được thử lại, không bao
+    // giờ kẹt vĩnh viễn nữa. Đây là dòng SỬA QUAN TRỌNG NHẤT cho bug này.
+    cycleInProgress = false;
+  }
 }
 
 // ==========================================
