@@ -132,7 +132,30 @@ function sleep(ms) {
 }
 
 async function refreshAllCandles() {
-  if (cycleInProgress || symbolList.length === 0) return;
+  if (cycleInProgress) return;
+
+  // BUG ĐÃ SỬA (người dùng phát hiện qua log thật): TRƯỚC ĐÂY nếu
+  // `symbolList` rỗng (VD lỗi lúc khởi động - 418 do dính rate-limit/ban
+  // tạm thời từ Binance ngay lúc server vừa lên) thì hàm này ÂM THẦM
+  // `return` ở đây MÃI MÃI - dù `setInterval` vẫn gọi lại đều đặn mỗi 90s,
+  // không có lấy 1 dòng log, KHÔNG CÓ CƠ CHẾ THỬ LẠI nào cả - server sống
+  // (Express vẫn chạy) nhưng phần lấy giá coi như CHẾT HẲN tới khi có người
+  // tự khởi động lại server. Giờ THỬ TẢI LẠI danh sách symbol NGAY TẠI ĐÂY
+  // mỗi khi thấy rỗng - vì hàm này vốn đã được gọi lại đều đặn mỗi 90s qua
+  // `setInterval`, tự nhiên có được nhịp thử lại KHÔNG CẦN thêm cơ chế
+  // backoff riêng (90s giữa các lần thử là đủ giãn cách, không tính là dồn
+  // dập lên Binance - chỉ 2 request nhẹ/lần thử, không phải hàng trăm).
+  if (symbolList.length === 0) {
+    try {
+      symbolList = await loadSymbolList();
+      symbolListLoadedAt = Date.now();
+      console.log(`[Symbols] Thử lại THÀNH CÔNG - đã tải ${symbolList.length} symbol.`);
+    } catch (e) {
+      console.error('[Symbols] Thử lại vẫn lỗi:', e.message, '- sẽ thử lại ở chu kỳ 90s sau.');
+      return; // vẫn rỗng - KHÔNG chạy phần nến, đợi lần gọi kế tiếp.
+    }
+  }
+
   cycleInProgress = true;
   lastCycleStartedAt = Date.now();
 
@@ -209,11 +232,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     const data = {};
+    // Theo dõi mốc CŨ NHẤT trong số các symbol thực sự được đưa vào `data` -
+    // KHÔNG phải lúc server khởi động, mà là "lần refresh gần nhất của
+    // symbol cũ nhất". Cần TÍNH RIÊNG cho từng response (không phải 1 con
+    // số chung `lastCycleFinishedAt`) vì thiết kế cache đã CỐ Ý giữ lại
+    // entry CŨ khi 1 symbol fetch lỗi liên tục (xem `refreshAllCandles()`) -
+    // symbol đó có thể cũ hơn NHIỀU so với các symbol khác trong CÙNG
+    // response, dù cả 2 đều "đang có trong cache".
+    let oldestTimestamp = null;
     for (const symbol of symbolList) {
       const cached = candleCache.get(symbol);
       if (!cached) continue; // chưa kịp có cache (mới start) - app tự fallback Binance
       const price = priceAtMinutesAgo(cached.candles, minutesAgo);
-      if (price !== null) data[symbol] = price;
+      if (price !== null) {
+        data[symbol] = price;
+        if (oldestTimestamp === null || cached.timestamp < oldestTimestamp) {
+          oldestTimestamp = cached.timestamp;
+        }
+      }
     }
 
     // CHỈ mã hoá response THÀNH CÔNG (có data thật) - lỗi (400 ở trên) giữ
@@ -228,6 +264,11 @@ const server = http.createServer(async (req, res) => {
           window: windowParam,
           symbolCount: symbolList.length,
           cachedCount: Object.keys(data).length,
+          // MỚI: mốc CŨ NHẤT trong data trả về - app dùng để tự phát hiện
+          // "cache bị đơ" (VD dính rate-limit Binance kéo dài, HTTP vẫn 200
+          // bình thường nhưng data bên trong đã cũ) - KHÁC hẳn trường hợp
+          // rỗng (đã tự fallback qua check `isNotEmpty` từ trước).
+          oldestDataAtMs: oldestTimestamp,
           data,
         })
       )
@@ -273,8 +314,13 @@ async function start() {
     console.log(`[Symbols] Đã tải ${symbolList.length} symbol (USDT-PERPETUAL, có trong 24hr ticker).`);
   } catch (e) {
     console.error('[Symbols] Lỗi tải danh sách symbol lúc start:', e.message);
-    // KHÔNG crash server - /health sẽ báo symbolCount=0, tự thử lại ở
-    // chu kỳ refresh đầu tiên bên dưới nếu symbolList rỗng.
+    // KHÔNG crash server - BUG ĐÃ SỬA: TRƯỚC ĐÂY comment ở đây ghi "tự thử
+    // lại ở chu kỳ refresh sau" nhưng THỰC RA CHƯA LÀM - `refreshAllCandles()`
+    // cũ chỉ `return` im lặng nếu `symbolList` rỗng, KHÔNG thử tải lại bao
+    // giờ (server sống nhưng phần lấy giá coi như chết hẳn tới khi restart
+    // thủ công). Giờ ĐÃ SỬA THẬT trong `refreshAllCandles()` - mỗi lần gọi
+    // (kể cả từ `setInterval` mỗi 90s bên dưới) đều tự thử `loadSymbolList()`
+    // lại nếu đang rỗng, có log rõ ràng cho cả 2 trường hợp thành công/vẫn lỗi.
   }
 
   // Chu kỳ ĐẦU TIÊN chạy ngay (không đợi đủ 90s mới có data lần đầu).
