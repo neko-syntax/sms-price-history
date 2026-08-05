@@ -84,6 +84,13 @@ let lastCycleStartedAt = null;
 let lastCycleFinishedAt = null;
 let cycleInProgress = false;
 
+// MỚI: cơ chế "nghỉ" khi phát hiện bị Binance ban diện rộng (418/429) - xem
+// giải thích đầy đủ ở chỗ dùng (`refreshAllCandles`). KHÔNG dùng DB, mất
+// khi restart cũng KHÔNG SAO (restart giữa lúc bị ban thì request đầu tiên
+// sau restart sẽ lại phát hiện ban ngay, tự set lại cooldown bình thường).
+let banCooldownUntil = 0;
+let consecutiveBanCycles = 0;
+
 // ==========================================
 // 2. LẤY DANH SÁCH SYMBOL - Y HỆT LOGIC APP FLUTTER (`explore_screen.dart`
 // `_allSymbols`): GIAO giữa exchangeInfo (USDT+PERPETUAL+TRADING) VÀ có mặt
@@ -132,7 +139,22 @@ async function fetchCandlesForSymbol(symbol, failures) {
       // lỗi mạng/timeout thường (symbol lẻ tẻ, không đáng lo).
       const status = error.response?.status;
       const reason = status ? `HTTP_${status}` : error.code || error.message || 'unknown';
-      failures.push({ symbol, reason });
+      // MỚI: Binance LUÔN kèm header `Retry-After` (số giây) khi trả
+      // 418/429 - có ca còn kèm mốc thời gian TUYỆT ĐỐI hết ban
+      // (`data.data.retryAfter`, epoch ms) ngay trong nội dung lỗi. Ưu
+      // tiên đọc mốc tuyệt đối (chính xác hơn - không lệch dù server xử lý
+      // chậm 1 chút), fallback qua header dạng số giây nếu không có.
+      let banUntilMs = null;
+      if (status === 418 || status === 429) {
+        const bodyRetryAfterMs = error.response?.data?.data?.retryAfter;
+        const retryAfterHeaderSec = error.response?.headers?.['retry-after'];
+        if (typeof bodyRetryAfterMs === 'number') {
+          banUntilMs = bodyRetryAfterMs;
+        } else if (retryAfterHeaderSec) {
+          banUntilMs = Date.now() + Number(retryAfterHeaderSec) * 1000;
+        }
+      }
+      failures.push({ symbol, reason, banUntilMs });
     }
     return null;
   }
@@ -154,6 +176,21 @@ async function refreshAllCandles() {
     const stuckMs = lastCycleStartedAt ? Date.now() - lastCycleStartedAt : null;
     console.warn(
       `[Cycle] Chu kỳ trước vẫn đang chạy (bắt đầu ${stuckMs}ms trước) - bỏ qua lần gọi này.`
+    );
+    return;
+  }
+
+  // MỚI: đang trong thời gian "nghỉ" do chu kỳ TRƯỚC phát hiện ban diện
+  // rộng - bỏ qua HẲN, KHÔNG gửi thêm request nào cả. LÝ DO: gửi tiếp trong
+  // lúc đang bị Binance ban (418) có thể khiến họ GIA HẠN thời gian ban lâu
+  // hơn (theo đúng chính sách chống spam của họ), dù request có gửi đúng
+  // nhịp/không dồn dập tới đâu - vì lúc này KHÔNG PHẢI vấn đề tốc độ, mà là
+  // IP đã bị đưa vào danh sách chặn, chỉ có CHỜ mới hết.
+  if (Date.now() < banCooldownUntil) {
+    console.warn(
+      `[Cycle] Đang NGHỈ do nghi ngờ bị Binance ban (còn ${Math.ceil(
+        (banCooldownUntil - Date.now()) / 1000
+      )}s) - bỏ qua, không gửi thêm request nào để tránh bị gia hạn ban.`
     );
     return;
   }
@@ -243,10 +280,39 @@ async function refreshAllCandles() {
     const banLikeCount = failures.filter(
       (f) => f.reason === 'HTTP_429' || f.reason === 'HTTP_418'
     ).length;
+    const banRatio = symbolList.length > 0 ? banLikeCount / symbolList.length : 0;
     if (banLikeCount >= 20) {
+      // MỚI: nếu Binance có kèm mốc hết ban, log ra CHÍNH XÁC còn bao lâu -
+      // đỡ phải mù mờ đoán "cứ thử lại mỗi 90s tới khi nào thì thôi".
+      const banUntilMs = failures.find((f) => f.banUntilMs)?.banUntilMs;
+      const banInfo = banUntilMs
+        ? ` - Binance báo hết ban lúc ${new Date(banUntilMs).toLocaleString('vi-VN', {
+            hour12: false,
+          })} (còn ~${Math.max(0, Math.ceil((banUntilMs - Date.now()) / 1000))}s)`
+        : ' - Binance không kèm mốc hết ban trong response lần này.';
       console.warn(
-        `[Cycle] ⚠ NGHI NGỜ ĐANG BỊ BINANCE RATE-LIMIT/BAN DIỆN RỘNG - ${banLikeCount}/${symbolList.length} symbol trả 429/418 trong chu kỳ này. Nếu lặp lại nhiều chu kỳ liên tiếp, cân nhắc tăng BATCH_DELAY_MS hoặc giảm BATCH_SIZE.`
+        `[Cycle] ⚠ NGHI NGỜ ĐANG BỊ BINANCE RATE-LIMIT/BAN DIỆN RỘNG - ${banLikeCount}/${symbolList.length} symbol trả 429/418 trong chu kỳ này${banInfo}`
       );
+    }
+
+    // MỚI: quá nửa symbol bị 429/418 -> gần như chắc chắn CẢ IP đang bị ban,
+    // không phải lỗi lẻ tẻ - kích hoạt "nghỉ" (xem giải thích đầy đủ ở đầu
+    // hàm, chỗ check `banCooldownUntil`). TĂNG DẦN thời gian nghỉ nếu ban
+    // LẶP LẠI nhiều chu kỳ liên tiếp (5 phút -> 10 phút -> ... tối đa 30
+    // phút) - tự thích nghi với ban ngắn lẫn ban dài, không cần biết trước
+    // Binance ban bao lâu.
+    if (banRatio >= 0.5) {
+      consecutiveBanCycles++;
+      const backoffMs = Math.min(5 * 60 * 1000 * consecutiveBanCycles, 30 * 60 * 1000);
+      banCooldownUntil = Date.now() + backoffMs;
+      console.warn(
+        `[Cycle] ⚠ BAN DIỆN RỘNG (${banLikeCount}/${symbolList.length}, lần liên tiếp thứ ${consecutiveBanCycles}) - TẠM NGHỈ ${
+          backoffMs / 1000
+        }s trước khi thử lại, không gửi thêm request trong lúc này.`
+      );
+    } else if (consecutiveBanCycles > 0) {
+      console.log(`[Cycle] Hết ban (tỉ lệ lỗi 429/418 đã giảm) - reset bộ đếm nghỉ.`);
+      consecutiveBanCycles = 0;
     }
   } catch (e) {
     // Watchdog cắt ngang (hoặc lỗi thật sự chưa lường trước) - LUÔN log rõ,
