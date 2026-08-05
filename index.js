@@ -1,6 +1,32 @@
 const http = require('http');
 const url = require('url');
 const axios = require('axios');
+const crypto = require('crypto');
+
+// ==========================================
+// 0. MÃ HOÁ RESPONSE - CÙNG CƠ CHẾ với máy chủ AI (`ai-machine-learning`,
+// `AutoExportCodec` bên Flutter): XOR từng byte với khoá lặp vòng + base64,
+// kèm chữ ký SHA-256 để app phát hiện dữ liệu bị sửa dọc đường. ĐÂY LÀ LÀM
+// RỐI + XÁC THỰC, KHÔNG PHẢI MÃ HOÁ THẬT (khoá nằm ngay trong mã nguồn app,
+// ai đọc file JS/APK đều lấy được) - chỉ chặn được người xem lướt qua tab
+// Network, và giúp app CHẮC CHẮN dữ liệu tới từ đúng server này, chưa bị
+// sửa dọc đường (MITM/proxy lạ). ĐỔI KHOÁ NÀY thì PHẢI đổi cả bên Flutter
+// (`PriceHistoryCodec._key`), không thì app sẽ từ chối mọi phản hồi.
+const RESPONSE_KEY = process.env.PRICE_HISTORY_KEY || 'sms_price_2026_qX9wRt';
+
+function xorEncode(raw) {
+  const data = Buffer.from(raw, 'utf8');
+  const k = Buffer.from(RESPONSE_KEY, 'utf8');
+  const out = Buffer.alloc(data.length);
+  for (let i = 0; i < data.length; i++) out[i] = data[i] ^ k[i % k.length];
+  return out.toString('base64');
+}
+
+function packResponse(dataObj) {
+  const rawJson = JSON.stringify(dataObj);
+  const sig = crypto.createHash('sha256').update(`${RESPONSE_KEY}|${rawJson}`).digest('hex');
+  return { v: 1, payload: xorEncode(rawJson), sig };
+}
 
 // ==========================================
 // 1. CẤU HÌNH
@@ -190,16 +216,21 @@ const server = http.createServer(async (req, res) => {
       if (price !== null) data[symbol] = price;
     }
 
+    // CHỈ mã hoá response THÀNH CÔNG (có data thật) - lỗi (400 ở trên) giữ
+    // JSON thường, đúng quy ước bên máy chủ AI (dễ debug hơn, không có gì
+    // nhạy cảm cần bảo vệ ở thông báo lỗi).
     res.writeHead(200);
     return res.end(
-      JSON.stringify({
-        status: 'success',
-        source: 'CANDLE_CACHE',
-        window: windowParam,
-        symbolCount: symbolList.length,
-        cachedCount: Object.keys(data).length,
-        data,
-      })
+      JSON.stringify(
+        packResponse({
+          status: 'success',
+          source: 'CANDLE_CACHE',
+          window: windowParam,
+          symbolCount: symbolList.length,
+          cachedCount: Object.keys(data).length,
+          data,
+        })
+      )
     );
   }
 
