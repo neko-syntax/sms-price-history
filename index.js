@@ -2,6 +2,7 @@ const http = require('http');
 const url = require('url');
 const axios = require('axios');
 const crypto = require('crypto');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ==========================================
 // 0. MÃ HOÁ RESPONSE - CÙNG CƠ CHẾ với máy chủ AI (`ai-machine-learning`,
@@ -32,6 +33,20 @@ function packResponse(dataObj) {
 // 1. CẤU HÌNH
 // ==========================================
 const PORT = process.env.PORT || 8088;
+
+// MỚI: proxy CHO MỌI REQUEST GỌI BINANCE - đối phó ban IP diện rộng (418).
+// CẮM-VÀO-LÀ-CHẠY qua 1 biến môi trường DUY NHẤT - KHÔNG set thì chạy y hệt
+// như cũ (gọi thẳng, không qua proxy), không cần đổi code gì thêm dù dùng
+// proxy nào (Webshare, proxy free, tự host...) - miễn đúng định dạng URL
+// chuẩn: http://user:pass@host:port (có user:pass hay không đều được).
+// Đặt trên Render: Environment -> thêm biến BINANCE_PROXY_URL.
+const BINANCE_PROXY_URL = process.env.BINANCE_PROXY_URL || '';
+const binanceProxyAgent = BINANCE_PROXY_URL ? new HttpsProxyAgent(BINANCE_PROXY_URL) : null;
+console.log(
+  binanceProxyAgent
+    ? '[Proxy] BINANCE_PROXY_URL đã set - mọi request Binance sẽ đi qua proxy.'
+    : '[Proxy] Không set BINANCE_PROXY_URL - gọi thẳng Binance như cũ (không proxy).'
+);
 
 // ⚠ BẢN SỬA: dùng ĐÚNG Futures (fapi), KHÔNG dùng Spot (api.binance.com) -
 // app Flutter scan Futures USDT-M Perpetual, Spot có thể thiếu symbol/giá
@@ -100,8 +115,8 @@ let consecutiveBanCycles = 0;
 // ==========================================
 async function loadSymbolList() {
   const [exInfoRes, tickerRes] = await Promise.all([
-    axios.get(FUT_EXCHANGE_INFO_URL, { timeout: 10000 }),
-    axios.get(FUT_24HR_TICKER_URL, { timeout: 10000 }),
+    axios.get(FUT_EXCHANGE_INFO_URL, { timeout: 10000, httpsAgent: binanceProxyAgent }),
+    axios.get(FUT_24HR_TICKER_URL, { timeout: 10000, httpsAgent: binanceProxyAgent }),
   ]);
 
   const perpetualSymbols = (exInfoRes.data.symbols || [])
@@ -121,6 +136,7 @@ async function fetchCandlesForSymbol(symbol, failures) {
     const response = await axios.get(FUT_KLINES_URL, {
       params: { symbol, interval: '1m', limit: CANDLE_LIMIT },
       timeout: 8000,
+      httpsAgent: binanceProxyAgent,
     });
     if (Array.isArray(response.data) && response.data.length > 0) {
       return response.data;
