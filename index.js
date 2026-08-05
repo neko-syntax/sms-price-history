@@ -2,7 +2,6 @@ const http = require('http');
 const url = require('url');
 const axios = require('axios');
 const crypto = require('crypto');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // ==========================================
 // 0. MÃ HOÁ RESPONSE - CÙNG CƠ CHẾ với máy chủ AI (`ai-machine-learning`,
@@ -33,20 +32,9 @@ function packResponse(dataObj) {
 // 1. CẤU HÌNH
 // ==========================================
 const PORT = process.env.PORT || 8088;
-
-// MỚI: proxy CHO MỌI REQUEST GỌI BINANCE - đối phó ban IP diện rộng (418).
-// CẮM-VÀO-LÀ-CHẠY qua 1 biến môi trường DUY NHẤT - KHÔNG set thì chạy y hệt
-// như cũ (gọi thẳng, không qua proxy), không cần đổi code gì thêm dù dùng
-// proxy nào (Webshare, proxy free, tự host...) - miễn đúng định dạng URL
-// chuẩn: http://user:pass@host:port (có user:pass hay không đều được).
-// Đặt trên Render: Environment -> thêm biến BINANCE_PROXY_URL.
-const BINANCE_PROXY_URL = process.env.BINANCE_PROXY_URL || '';
-const binanceProxyAgent = BINANCE_PROXY_URL ? new HttpsProxyAgent(BINANCE_PROXY_URL) : null;
-console.log(
-  binanceProxyAgent
-    ? '[Proxy] BINANCE_PROXY_URL đã set - mọi request Binance sẽ đi qua proxy.'
-    : '[Proxy] Không set BINANCE_PROXY_URL - gọi thẳng Binance như cũ (không proxy).'
-);
+// ĐÃ BỎ proxy (xoay vòng nhiều IP) - KHÔNG còn cần nữa: giờ chạy trên VPS
+// riêng, IP DEDICATED (không dùng chung với ai khác) - rủi ro "dính ban lây
+// từ người khác" mà proxy dùng chung từng gặp không còn áp dụng ở đây.
 
 // ⚠ BẢN SỬA: dùng ĐÚNG Futures (fapi), KHÔNG dùng Spot (api.binance.com) -
 // app Flutter scan Futures USDT-M Perpetual, Spot có thể thiếu symbol/giá
@@ -115,8 +103,8 @@ let consecutiveBanCycles = 0;
 // ==========================================
 async function loadSymbolList() {
   const [exInfoRes, tickerRes] = await Promise.all([
-    axios.get(FUT_EXCHANGE_INFO_URL, { timeout: 10000, httpsAgent: binanceProxyAgent }),
-    axios.get(FUT_24HR_TICKER_URL, { timeout: 10000, httpsAgent: binanceProxyAgent }),
+    axios.get(FUT_EXCHANGE_INFO_URL, { timeout: 10000 }),
+    axios.get(FUT_24HR_TICKER_URL, { timeout: 10000 }),
   ]);
 
   const perpetualSymbols = (exInfoRes.data.symbols || [])
@@ -136,7 +124,6 @@ async function fetchCandlesForSymbol(symbol, failures) {
     const response = await axios.get(FUT_KLINES_URL, {
       params: { symbol, interval: '1m', limit: CANDLE_LIMIT },
       timeout: 8000,
-      httpsAgent: binanceProxyAgent,
     });
     if (Array.isArray(response.data) && response.data.length > 0) {
       return response.data;
@@ -168,6 +155,11 @@ async function fetchCandlesForSymbol(symbol, failures) {
           banUntilMs = bodyRetryAfterMs;
         } else if (retryAfterHeaderSec) {
           banUntilMs = Date.now() + Number(retryAfterHeaderSec) * 1000;
+        } else {
+          // Binance không kèm mốc rõ ràng lần này - tự đặt 1 khoảng nghỉ AN
+          // TOÀN mặc định (2 phút - đúng mức BAN NGẮN NHẤT theo tài liệu
+          // Binance).
+          banUntilMs = Date.now() + 2 * 60 * 1000;
         }
       }
       failures.push({ symbol, reason, banUntilMs });
@@ -196,12 +188,12 @@ async function refreshAllCandles() {
     return;
   }
 
-  // MỚI: đang trong thời gian "nghỉ" do chu kỳ TRƯỚC phát hiện ban diện
-  // rộng - bỏ qua HẲN, KHÔNG gửi thêm request nào cả. LÝ DO: gửi tiếp trong
-  // lúc đang bị Binance ban (418) có thể khiến họ GIA HẠN thời gian ban lâu
-  // hơn (theo đúng chính sách chống spam của họ), dù request có gửi đúng
-  // nhịp/không dồn dập tới đâu - vì lúc này KHÔNG PHẢI vấn đề tốc độ, mà là
-  // IP đã bị đưa vào danh sách chặn, chỉ có CHỜ mới hết.
+  // Đang trong thời gian "nghỉ" do chu kỳ TRƯỚC phát hiện ban diện rộng -
+  // bỏ qua HẲN, KHÔNG gửi thêm request nào cả. LÝ DO: gửi tiếp trong lúc
+  // đang bị Binance ban (418) có thể khiến họ GIA HẠN thời gian ban lâu hơn
+  // (theo đúng chính sách chống spam của họ), dù request có gửi đúng nhịp/
+  // không dồn dập tới đâu - vì lúc này KHÔNG PHẢI vấn đề tốc độ, mà là IP đã
+  // bị đưa vào danh sách chặn, chỉ có CHỜ mới hết.
   if (Date.now() < banCooldownUntil) {
     console.warn(
       `[Cycle] Đang NGHỈ do nghi ngờ bị Binance ban (còn ${Math.ceil(
@@ -311,7 +303,7 @@ async function refreshAllCandles() {
       );
     }
 
-    // MỚI: quá nửa symbol bị 429/418 -> gần như chắc chắn CẢ IP đang bị ban,
+    // Quá nửa symbol bị 429/418 -> gần như chắc chắn CẢ IP đang bị ban,
     // không phải lỗi lẻ tẻ - kích hoạt "nghỉ" (xem giải thích đầy đủ ở đầu
     // hàm, chỗ check `banCooldownUntil`). TĂNG DẦN thời gian nghỉ nếu ban
     // LẶP LẠI nhiều chu kỳ liên tiếp (5 phút -> 10 phút -> ... tối đa 30
