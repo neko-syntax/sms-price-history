@@ -231,25 +231,27 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // Symbol quá cũ (kẹt lỗi liên tục nhiều chu kỳ, cache không được làm
+    // mới) -> BỎ QUA, coi như "không có" (giống hệt nhánh `!cached` phía
+    // trên) - để app tự fallback ĐÚNG những symbol lỗi đó qua đường
+    // Binance-trực-tiếp sẵn có, KHÔNG kéo cả response (~500 symbol khác vẫn
+    // tươi bình thường) xuống theo. BUG ĐÃ SỬA (người dùng phát hiện qua
+    // DevTools: server luôn trả data mới, nhưng Flutter cứ fallback) -
+    // TRƯỚC ĐÂY tính "mốc CŨ NHẤT trong toàn bộ response" rồi gửi cho app
+    // tự so ngưỡng - chỉ CẦN ĐÚNG 1 symbol kẹt lỗi (VD coin mới delist) là
+    // kéo mốc đó cũ MÃI MÃI, dù 499 symbol còn lại tươi hoàn toàn - khiến
+    // app fallback TOÀN BỘ oan uổng. Giờ lọc NGAY TẠI ĐÂY, per-symbol,
+    // không còn "1 con sâu làm rầu nồi canh" nữa.
+    const STALE_SYMBOL_MS = 10 * 60 * 1000; // 10 phút - rộng hơn TTL 90s nhiều lần
+
     const data = {};
-    // Theo dõi mốc CŨ NHẤT trong số các symbol thực sự được đưa vào `data` -
-    // KHÔNG phải lúc server khởi động, mà là "lần refresh gần nhất của
-    // symbol cũ nhất". Cần TÍNH RIÊNG cho từng response (không phải 1 con
-    // số chung `lastCycleFinishedAt`) vì thiết kế cache đã CỐ Ý giữ lại
-    // entry CŨ khi 1 symbol fetch lỗi liên tục (xem `refreshAllCandles()`) -
-    // symbol đó có thể cũ hơn NHIỀU so với các symbol khác trong CÙNG
-    // response, dù cả 2 đều "đang có trong cache".
-    let oldestTimestamp = null;
+    const now = Date.now();
     for (const symbol of symbolList) {
       const cached = candleCache.get(symbol);
       if (!cached) continue; // chưa kịp có cache (mới start) - app tự fallback Binance
+      if (now - cached.timestamp > STALE_SYMBOL_MS) continue; // symbol này kẹt lỗi lâu - bỏ qua riêng nó
       const price = priceAtMinutesAgo(cached.candles, minutesAgo);
-      if (price !== null) {
-        data[symbol] = price;
-        if (oldestTimestamp === null || cached.timestamp < oldestTimestamp) {
-          oldestTimestamp = cached.timestamp;
-        }
-      }
+      if (price !== null) data[symbol] = price;
     }
 
     // CHỈ mã hoá response THÀNH CÔNG (có data thật) - lỗi (400 ở trên) giữ
@@ -264,11 +266,14 @@ const server = http.createServer(async (req, res) => {
           window: windowParam,
           symbolCount: symbolList.length,
           cachedCount: Object.keys(data).length,
-          // MỚI: mốc CŨ NHẤT trong data trả về - app dùng để tự phát hiện
-          // "cache bị đơ" (VD dính rate-limit Binance kéo dài, HTTP vẫn 200
-          // bình thường nhưng data bên trong đã cũ) - KHÁC hẳn trường hợp
-          // rỗng (đã tự fallback qua check `isNotEmpty` từ trước).
-          oldestDataAtMs: oldestTimestamp,
+          // MỚI (đã sửa lại): SỨC KHOẺ CẢ CHU KỲ REFRESH NỀN - `null` nếu
+          // CHƯA từng có 1 chu kỳ nào chạy xong (mới start). Đây là chỉ số
+          // TOÀN CỤC, không lệ thuộc số phận của 1 symbol lẻ nào - app dùng
+          // để tự phát hiện "vòng lặp nền có còn sống không" (VD dính
+          // rate-limit Binance liên tục khiến CẢ CHU KỲ không xong nổi
+          // trong thời gian dài) mà không sợ 1 symbol lỗi đơn lẻ báo động
+          // giả (đã lọc riêng ở trên rồi).
+          lastCycleFinishedAtMs: lastCycleFinishedAt,
           data,
         })
       )
