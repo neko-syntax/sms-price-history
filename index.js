@@ -514,14 +514,14 @@ const server = http.createServer(async (req, res) => {
     const minutesAgo = WINDOW_TO_MINUTES[windowParam];
 
     // Whitelist rõ ràng - khung lạ thì báo lỗi ngay, không dò cache vô ích.
+    // MỚI (theo yêu cầu bảo mật): response PUBLIC ra ngoài LUÔN tiếng Anh,
+    // KHÔNG gợi ý giá trị hợp lệ là gì - ai gọi sai hẳn không phải app thật
+    // (app thật luôn gửi đúng), gợi ý chỉ giúp dò qué/probe API dễ hơn. Log
+    // console (chỉ admin đọc) vẫn giữ tiếng Việt như mọi log khác trong file.
     if (minutesAgo === undefined) {
+      console.warn(`[history_prices] window không hợp lệ: "${windowParam}"`);
       res.writeHead(400);
-      return res.end(
-        JSON.stringify({
-          status: 'error',
-          message: `window không hợp lệ - chỉ nhận: ${Object.keys(WINDOW_TO_MINUTES).join(', ')}`,
-        })
-      );
+      return res.end(JSON.stringify({ status: 'error', message: 'Invalid request.' }));
     }
 
     // Symbol quá cũ (kẹt lỗi liên tục nhiều chu kỳ, cache không được làm
@@ -598,15 +598,21 @@ const server = http.createServer(async (req, res) => {
     const pathSymbol = pathname.startsWith('/api/mc/') ? pathname.slice('/api/mc/'.length) : '';
     const rawSymbol = decodeURIComponent(pathSymbol || query.symbol || '').trim();
 
+    // MỚI (theo yêu cầu bảo mật - ÁP DỤNG CHUNG cho cả file, xem giải thích
+    // ở endpoint `/api/history_prices` phía trên): response PUBLIC LUÔN
+    // tiếng Anh, KHÔNG gợi ý cách gọi đúng - console log (admin-only) mới
+    // giữ chi tiết bằng tiếng Việt.
     if (!rawSymbol) {
+      console.warn('[mc] Request thiếu symbol.');
       res.writeHead(400);
-      return res.end(JSON.stringify({ status: 'error', message: 'Thiếu symbol - dùng /api/mc/BTCUSDT hoặc /api/mc?symbol=BTCUSDT' }));
+      return res.end(JSON.stringify({ status: 'error', message: 'Invalid request.' }));
     }
 
     const found = lookupMarketCap(rawSymbol);
     if (!found) {
+      console.warn(`[mc] Không tìm thấy market cap cho "${rawSymbol}".`);
       res.writeHead(404);
-      return res.end(JSON.stringify({ status: 'error', message: `Không tìm thấy market cap cho "${rawSymbol}"` }));
+      return res.end(JSON.stringify({ status: 'error', message: 'Not found.' }));
     }
 
     res.writeHead(200);
