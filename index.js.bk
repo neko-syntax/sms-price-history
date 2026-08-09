@@ -65,146 +65,6 @@ const BATCH_SIZE = 20;
 const BATCH_DELAY_MS = 100;
 
 // ==========================================
-// MỚI: MARKET CAP (gộp từ server riêng trước đây - dùng CHUNG 1 tiến trình,
-// 1 cổng với price-history, ÁP DỤNG ĐÚNG các nguyên tắc đã chứng minh hoạt
-// động tốt ở phần nến: watchdog chống treo, log rõ ràng, không im lặng, TTL
-// hợp lý theo đúng NHỊP ĐỔI THẬT của dữ liệu (marketcap không đổi nhanh như
-// giá nến - giữ TTL 2 tiếng như bản gốc, KHÁC 90s của nến - đây là TTL ĐÚNG
-// cho marketcap, không phải "chưa tối ưu").
-// ==========================================
-const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || 'CG-vQyeAManc8vSngMb1TfPpp88';
-const MC_REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 tiếng - khớp nhịp đổi thật của vốn hoá.
-// Watchdog CHO CẢ VÒNG CÀO (giống hệt lý do đã áp dụng cho nến - vòng lặp
-// gọi CoinGecko nhiều trang liên tiếp CŨNG là 1 chuỗi request có thể treo ở
-// tầng TCP/DNS mà `fetch` không luôn tự huỷ được, cùng LOẠI RỦI RO đã từng
-// gây bug "câm lặng" cho phần nến trước khi có watchdog - áp dụng NGAY TỪ
-// ĐẦU cho marketcap, không đợi tự dính bug rồi mới vá).
-const MC_CYCLE_WATCHDOG_MS = 5 * 60 * 1000; // rộng rãi cho vài trăm trang CoinGecko.
-const MC_PAGE_DELAY_MS = 250; // giữ nguyên nhịp nghỉ giữa trang như bản gốc.
-
-/** @type {Record<string, number>} symbol GỐC (không hậu tố USDT, không prefix nhân hệ số) -> market cap USD */
-let marketCapCache = {};
-let mcLastUpdated = null;
-let mcCycleInProgress = false;
-let mcLastCycleStartedAt = null;
-let mcLastCycleFinishedAt = null;
-
-/// Quy đổi symbol kiểu Binance FUTURES (VD "1000PEPEUSDT", "BTCUSDT") về
-/// symbol GỐC dùng làm khoá trong `marketCapCache` (VD "PEPE", "BTC") - bỏ
-/// hậu tố "USDT" + bỏ tiền tố SỐ nhân hệ số (1000/10000/1000000...) Binance
-/// hay gắn trước 1 số coin nhỏ giá trị (VD 1000SHIB = hợp đồng đại diện cho
-/// 1000 SHIB thật). GIỚI HẠN ĐÃ BIẾT: không xử lý dạng tiền tố CHỮ+SỐ hiếm
-/// gặp kiểu "1M..." (nếu Binance có coin dạng này) - CHỈ xử lý tiền tố SỐ
-/// THUẦN, đủ dùng cho tuyệt đại đa số symbol thực tế hiện có.
-function normalizeToBaseSymbol(rawSymbol) {
-  let s = String(rawSymbol || '').toUpperCase().trim();
-  if (s.endsWith('USDT')) s = s.slice(0, -4);
-  s = s.replace(/^\d+/, ''); // bỏ tiền tố số đứng đầu (1000, 10000, 1000000...)
-  return s;
-}
-
-/// Tra market cap cho 1 symbol Futures BẤT KỲ (tự quy đổi prefix/hậu tố) -
-/// dùng cho endpoint `/api/mc/:symbol` - trả `null` nếu không tìm thấy.
-function lookupMarketCap(rawSymbol) {
-  const base = normalizeToBaseSymbol(rawSymbol);
-  if (!base || !(base in marketCapCache)) return null;
-  return { symbol: base, marketCap: marketCapCache[base] };
-}
-
-/// Cào TOÀN BỘ market cap từ CoinGecko (Binance USDT tickers, phân trang) -
-/// PORT lại từ server marketcap cũ, THÊM watchdog bảo vệ cả vòng cào (xem
-/// giải thích ở khai báo `MC_CYCLE_WATCHDOG_MS`) + log nhất quán kiểu
-/// `[MC-Cycle]` (song song `[Cycle]` của phần nến, dễ phân biệt trong log
-/// chung 1 tiến trình).
-async function updateMarketCapCache() {
-  if (mcCycleInProgress) {
-    const stuckMs = mcLastCycleStartedAt ? Date.now() - mcLastCycleStartedAt : null;
-    console.warn(`[MC-Cycle] Chu kỳ trước vẫn đang chạy (bắt đầu ${stuckMs}ms trước) - bỏ qua lần gọi này.`);
-    return;
-  }
-
-  mcCycleInProgress = true;
-  mcLastCycleStartedAt = Date.now();
-  console.log(`[MC-Cycle] Bắt đầu cào market cap từ CoinGecko...`);
-
-  const tempMap = {};
-  let pageCount = 0;
-
-  try {
-    await Promise.race([
-      (async () => {
-        let page = 1;
-        while (true) {
-          const mcUrl = `https://api.coingecko.com/api/v3/exchanges/binance/tickers?order=volume_desc&page=${page}`;
-          const response = await fetch(mcUrl, { headers: { 'x-cg-demo-api-key': COINGECKO_API_KEY } });
-
-          if (!response.ok) {
-            console.error(`[MC-Cycle] Trang ${page} trả lỗi HTTP: ${response.status} - dừng vòng cào.`);
-            break;
-          }
-
-          const data = await response.json();
-          const tickers = Array.isArray(data?.tickers) ? data.tickers : [];
-          if (tickers.length === 0) {
-            pageCount = page - 1;
-            break;
-          }
-
-          for (const item of tickers) {
-            if (
-              typeof item?.target === 'string' &&
-              item.target.toUpperCase() === 'USDT' &&
-              item.base &&
-              typeof item.coin_mcap_usd === 'number'
-            ) {
-              const symbol = item.base.toUpperCase();
-              // Ưu tiên giữ giá trị đầu tiên gặp (volume cao nhất, đúng thứ
-              // tự `order=volume_desc` của CoinGecko).
-              if (!(symbol in tempMap)) tempMap[symbol] = item.coin_mcap_usd;
-            }
-          }
-
-          page++;
-          await sleep(MC_PAGE_DELAY_MS);
-        }
-      })(),
-      sleep(MC_CYCLE_WATCHDOG_MS).then(() => {
-        throw new Error(`MC_CYCLE_WATCHDOG_TIMEOUT sau ${MC_CYCLE_WATCHDOG_MS}ms - có request treo bất thường`);
-      }),
-    ]);
-
-    const totalCount = Object.keys(tempMap).length;
-    if (totalCount > 0) {
-      marketCapCache = tempMap;
-      mcLastUpdated = new Date().toISOString();
-      mcLastCycleFinishedAt = Date.now();
-      console.log(
-        `[MC-Cycle] Xong - ${totalCount} coin USDT, ${pageCount} trang, mất ${
-          mcLastCycleFinishedAt - mcLastCycleStartedAt
-        }ms.`
-      );
-    } else {
-      console.warn('[MC-Cycle] Không lấy được dữ liệu mới (0 coin) - giữ nguyên cache cũ, không ghi đè.');
-    }
-  } catch (e) {
-    // Watchdog cắt ngang HOẶC lỗi mạng thật sự - LUÔN log rõ (đúng nguyên
-    // tắc "dù lý do gì cũng phải log" đã áp dụng cho phần nến) - GIỮ
-    // NGUYÊN cache cũ (nếu có), không xoá - "dữ liệu hơi cũ" vẫn tốt hơn
-    // "không có gì".
-    console.error(
-      `[MC-Cycle] LỖI/TREO giữa chừng: ${e.message} - giữ nguyên cache cũ (${
-        Object.keys(marketCapCache).length
-      } coin).`
-    );
-  } finally {
-    // LUÔN reset - dù thành công/lỗi/watchdog cắt - chu kỳ SAU (2 tiếng
-    // tới) chắc chắn được thử lại, không bao giờ kẹt vĩnh viễn (đúng bài
-    // học đã áp dụng cho phần nến).
-    mcCycleInProgress = false;
-  }
-}
-
-// ==========================================
 // TÍNH TOÁN NGÂN SÁCH REQUEST (ghi lại để lần sau đổi số dễ đối chiếu)
 // ==========================================
 // limit=250 -> weight Binance = 2/request (limit 100-500 dải weight=2).
@@ -573,56 +433,6 @@ const server = http.createServer(async (req, res) => {
     );
   }
 
-  // ---- /api/market-caps - TOÀN BỘ market cap (đã gộp từ server riêng
-  // trước đây) - dùng khi FLUTTER cần tự so khớp/xử lý prefix Futures
-  // (1000/10000/1000000...) phía client, đỡ phải gọi lẻ từng coin. ----
-  if (pathname === '/api/market-caps') {
-    res.writeHead(200);
-    return res.end(
-      JSON.stringify(
-        packResponse({
-          status: 'success',
-          last_updated: mcLastUpdated,
-          total: Object.keys(marketCapCache).length,
-          data: marketCapCache,
-        })
-      )
-    );
-  }
-
-  // ---- /api/mc/:symbol HOẶC /api/mc?symbol=:symbol - market cap ĐÚNG 1
-  // coin (nhẹ hơn get-all) - hỗ trợ CẢ 2 kiểu gọi, ưu tiên path segment nếu
-  // có. Tự quy đổi prefix/hậu tố Futures (xem `lookupMarketCap`) - endpoint
-  // này TỰ xử lý luôn, không bắt caller phải biết trước quy tắc. ----
-  if (pathname === '/api/mc' || pathname.startsWith('/api/mc/')) {
-    const pathSymbol = pathname.startsWith('/api/mc/') ? pathname.slice('/api/mc/'.length) : '';
-    const rawSymbol = decodeURIComponent(pathSymbol || query.symbol || '').trim();
-
-    if (!rawSymbol) {
-      res.writeHead(400);
-      return res.end(JSON.stringify({ status: 'error', message: 'Thiếu symbol - dùng /api/mc/BTCUSDT hoặc /api/mc?symbol=BTCUSDT' }));
-    }
-
-    const found = lookupMarketCap(rawSymbol);
-    if (!found) {
-      res.writeHead(404);
-      return res.end(JSON.stringify({ status: 'error', message: `Không tìm thấy market cap cho "${rawSymbol}"` }));
-    }
-
-    res.writeHead(200);
-    return res.end(
-      JSON.stringify(
-        packResponse({
-          status: 'success',
-          last_updated: mcLastUpdated,
-          query_symbol: rawSymbol,
-          matched_symbol: found.symbol,
-          market_cap: found.marketCap,
-        })
-      )
-    );
-  }
-
   // ---- /health - kiểm tra nhanh server đã sẵn sàng chưa ----
   if (pathname === '/health') {
     res.writeHead(200);
@@ -637,15 +447,6 @@ const server = http.createServer(async (req, res) => {
         lastCycleFinishedAt,
         lastCycleDurationMs:
           lastCycleFinishedAt && lastCycleStartedAt ? lastCycleFinishedAt - lastCycleStartedAt : null,
-        // MỚI: thêm sức khoẻ chu kỳ market cap - dùng ĐÚNG mẫu tên field
-        // (tiền tố "mc") song song với phần nến ở trên, dễ đối chiếu.
-        mcCoinCount: Object.keys(marketCapCache).length,
-        mcLastUpdated,
-        mcCycleInProgress,
-        mcLastCycleStartedAt,
-        mcLastCycleFinishedAt,
-        mcLastCycleDurationMs:
-          mcLastCycleFinishedAt && mcLastCycleStartedAt ? mcLastCycleFinishedAt - mcLastCycleStartedAt : null,
       })
     );
   }
@@ -683,12 +484,6 @@ async function start() {
   // Chu kỳ ĐẦU TIÊN chạy ngay (không đợi đủ 90s mới có data lần đầu).
   refreshAllCandles();
   setInterval(refreshAllCandles, REFRESH_INTERVAL_MS);
-
-  // MỚI: market cap - chu kỳ ĐẦU TIÊN chạy ngay (fire-and-forget, KHÔNG
-  // `await` - không lý do gì chặn `start()`/cổng HTTP chờ vòng cào CoinGecko
-  // hàng trăm trang xong mới thôi, cùng tinh thần "mở cổng ngay" ở trên).
-  updateMarketCapCache();
-  setInterval(updateMarketCapCache, MC_REFRESH_INTERVAL_MS);
 }
 
 start();
