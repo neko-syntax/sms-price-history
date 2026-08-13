@@ -490,6 +490,25 @@ function priceAtMinutesAgo(candles, minutesAgo) {
   return parseFloat(candles[idx][4]); // index 4 = giá đóng cửa (close)
 }
 
+// MỚI (theo đúng yêu cầu người dùng - server ĐÃ tải sẵn kline ĐẦY ĐỦ mỗi
+// chu kỳ refresh nền, chỉ là trước đây endpoint chưa TRẢ thêm khối lượng -
+// không phải giới hạn dữ liệu, chỉ là response chưa khai thác hết): CỘNG
+// DỒN khối lượng QUY ĐỔI USDT (index [7] - "quote asset volume" của từng
+// nến 1 phút, CHÍNH XÁC hơn tự nhân volume*close phía Flutter) của TẤT CẢ
+// nến 1 phút trong ĐÚNG khung `minutesAgo` gần nhất - đại diện đúng "tổng
+// khối lượng giao dịch trong khung đó", KHÔNG PHẢI khối lượng tại 1 điểm
+// (khác hẳn giá - giá chỉ cần 1 điểm, khối lượng cần CỘNG DỒN cả khung).
+function volumeInWindow(candles, minutesAgo) {
+  if (!candles || candles.length === 0) return null;
+  const startIdx = Math.max(0, candles.length - minutesAgo);
+  let total = 0;
+  for (let i = startIdx; i < candles.length; i++) {
+    const v = parseFloat(candles[i][7]);
+    if (!Number.isNaN(v)) total += v;
+  }
+  return total;
+}
+
 // ==========================================
 // 6. HTTP SERVER
 // ==========================================
@@ -538,6 +557,13 @@ const server = http.createServer(async (req, res) => {
     const STALE_SYMBOL_MS = 10 * 60 * 1000; // 10 phút - rộng hơn TTL 90s nhiều lần
 
     const data = {};
+    // MỚI: khối lượng trong ĐÚNG khung đang chọn - dùng cho template Admin
+    // Panel "Biến động Volume" (đã trao đổi với người dùng - dữ liệu này
+    // VỐN ĐÃ CÓ SẴN trong cache, chỉ là trước đây response không trả ra).
+    // Field RIÊNG, KHÔNG lẫn vào `data` (data giữ nguyên ý nghĩa "giá" như
+    // cũ, không phá vỡ bất kỳ client CŨ nào đang đọc `data` mong đợi toàn
+    // số giá).
+    const volumeData = {};
     const now = Date.now();
     for (const symbol of symbolList) {
       const cached = candleCache.get(symbol);
@@ -545,6 +571,8 @@ const server = http.createServer(async (req, res) => {
       if (now - cached.timestamp > STALE_SYMBOL_MS) continue; // symbol này kẹt lỗi lâu - bỏ qua riêng nó
       const price = priceAtMinutesAgo(cached.candles, minutesAgo);
       if (price !== null) data[symbol] = price;
+      const vol = volumeInWindow(cached.candles, minutesAgo);
+      if (vol !== null) volumeData[symbol] = Math.round(vol);
     }
 
     // CHỈ mã hoá response THÀNH CÔNG (có data thật) - lỗi (400 ở trên) giữ
@@ -568,6 +596,7 @@ const server = http.createServer(async (req, res) => {
           // giả (đã lọc riêng ở trên rồi).
           lastCycleFinishedAtMs: lastCycleFinishedAt,
           data,
+          volumeData,
         })
       )
     );
