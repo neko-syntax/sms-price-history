@@ -602,6 +602,48 @@ const server = http.createServer(async (req, res) => {
     );
   }
 
+  // ---- /api/recent_volumes?count=30 - MỚI: khối lượng TỪNG NẾN 1 PHÚT gần
+  // nhất (KHÔNG cộng dồn thành 1 số như `/api/history_prices` - trả về
+  // MẢNG riêng từng phút) - dùng cho `market_watcher.js` (Node.js RIÊNG,
+  // không liên quan Flutter) tự phát hiện "nổ khối lượng" (so khối lượng
+  // NẾN MỚI NHẤT với TRUNG BÌNH các nến gần đó - cần dữ liệu TỪNG NẾN, tổng
+  // gộp không tính được kiểu so sánh này). Dữ liệu này server ĐÃ CÓ SẴN
+  // trong `candleCache` (không tải thêm gì mới từ Binance) - CHỈ thêm 1
+  // đường TRẢ RA, cùng tinh thần `volumeData` đã thêm trước đó.
+  if (pathname === '/api/recent_volumes') {
+    // Giới hạn 5-120 - đủ rộng cho baseline trung bình hợp lý, không cho
+    // request kéo quá nhiều (tốn băng thông vô ích, `candleCache` tối đa
+    // lưu MAX_WINDOW_MINUTES = 240 phút nến thôi, xin quá số đó cũng vô
+    // nghĩa - tự kẹp lại, không cần báo lỗi).
+    const rawCount = parseInt(query.count, 10);
+    const count = Number.isFinite(rawCount) ? Math.min(Math.max(rawCount, 5), 120) : 30;
+
+    const now = Date.now();
+    const STALE_SYMBOL_MS = 10 * 60 * 1000; // đúng ngưỡng với /api/history_prices ở trên
+    const volumes = {};
+    for (const [symbol, cached] of candleCache.entries()) {
+      if (now - cached.timestamp > STALE_SYMBOL_MS) continue;
+      const candles = cached.candles;
+      if (!candles || candles.length < 2) continue;
+      const recent = candles.slice(-count);
+      const arr = recent.map((c) => parseFloat(c[7])).filter((v) => !Number.isNaN(v));
+      if (arr.length >= 2) volumes[symbol] = arr; // cần TỐI THIỂU 2 điểm mới so sánh được gì
+    }
+
+    res.writeHead(200);
+    return res.end(
+      JSON.stringify(
+        packResponse({
+          status: 'success',
+          count,
+          symbolCount: Object.keys(volumes).length,
+          lastCycleFinishedAtMs: lastCycleFinishedAt,
+          volumes,
+        })
+      )
+    );
+  }
+
   // ---- /api/market-caps - TOÀN BỘ market cap (đã gộp từ server riêng
   // trước đây) - dùng khi FLUTTER cần tự so khớp/xử lý prefix Futures
   // (1000/10000/1000000...) phía client, đỡ phải gọi lẻ từng coin. ----
