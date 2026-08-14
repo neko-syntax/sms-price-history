@@ -53,6 +53,24 @@ const MAX_WINDOW_MINUTES = Math.max(...Object.values(WINDOW_TO_MINUTES)); // 240
 // ra được CẢ 6 khung, thay vì gọi riêng 6 lần/symbol như bản cũ.
 const CANDLE_LIMIT = MAX_WINDOW_MINUTES + 10; // 250
 
+// MỚI: hệ thống nến 15m RIÊNG BIỆT HOÀN TOÀN - CHỈ phục vụ
+// `market_watcher.js` (phát hiện nổ volume khung 15m/1h, KHÔNG liên quan gì
+// tới `/api/history_prices`/`/api/recent_volumes` (1m) đang chạy sẵn) -
+// ĐÚNG nguyên tắc người dùng chốt: nhu cầu dữ liệu MỚI nào cũng có cache +
+// endpoint RIÊNG, KHÔNG nhồi thêm vào hệ thống 1m cũ (tránh làm nặng/chậm
+// các nơi ĐANG dùng hệ thống đó mà không cần dữ liệu 15m này - VD Explore).
+//
+// SỐ NẾN CẦN: baseline "trung bình 30 nến" áp dụng CHO CẢ khung 15m LẪN 1h
+// (suy ra từ 15m, GHÉP 4 nến 15m thành 1 "nến 1h", đúng ý người dùng "15
+// suy ra 1h vẫn đủ dùng", KHÔNG cần cache riêng khung 1h). Khung 1h cần
+// NHIỀU nến 15m nhất: 31 "nến 1h" × 4 = 124 nến 15m - lấy dư ra thành 140
+// cho an toàn (nến chưa đóng kịp/mạng chậm).
+const CANDLE_LIMIT_15M = 140;
+// Refresh chậm hơn hệ 1m (90s) - nến 15m đổi CHẬM hơn nhiều, không cần tần
+// suất cao - 3 phút vẫn đủ tươi cho việc `market_watcher.js` kiểm tra mỗi 5
+// phút (luôn có ít nhất 1 lượt refresh 15m mới trong khoảng đó).
+const REFRESH_INTERVAL_15M_MS = 3 * 60 * 1000;
+
 // Refresh nến CHỦ ĐỘNG theo chu kỳ (KHÔNG đợi request tới mới fetch) - đúng
 // yêu cầu "cứ lấy sẵn để đó". 90s (không phải 60s) - có biên an toàn hơn so
 // với trần weight Binance (xem tính toán ở dưới).
@@ -233,6 +251,18 @@ let cycleInProgress = false;
 // sau restart sẽ lại phát hiện ban ngay, tự set lại cooldown bình thường).
 let banCooldownUntil = 0;
 let consecutiveBanCycles = 0;
+
+// MỚI: state RIÊNG cho hệ 15m (xem giải thích ở khai báo `CANDLE_LIMIT_15M`
+// phía trên) - TÁCH BIỆT HOÀN TOÀN khỏi state hệ 1m ở trên (không dùng
+// chung `candleCache`/`cycleInProgress`/... - 1 hệ lỗi/treo KHÔNG ảnh hưởng
+// gì tới hệ còn lại). CHIA SẺ ĐÚNG 1 THỨ DUY NHẤT với hệ 1m: `banCooldownUntil`
+// (ban Binance là do CHUNG 1 địa chỉ IP server, áp dụng cho MỌI request bất
+// kể khung nào - hợp lý dùng chung biến này).
+/** Map<symbol, {timestamp:number, candles: Array<[openTime,open,high,low,close,...]>}> */
+const candleCache15m = new Map();
+let lastCycleStartedAt15m = null;
+let lastCycleFinishedAt15m = null;
+let cycleInProgress15m = false;
 
 // ==========================================
 // 2. LẤY DANH SÁCH SYMBOL - Y HỆT LOGIC APP FLUTTER (`explore_screen.dart`
@@ -480,6 +510,97 @@ async function refreshAllCandles() {
 }
 
 // ==========================================
+// 4.1 HỆ 15m RIÊNG BIỆT - CHỈ phục vụ `market_watcher.js` (phát hiện nổ
+// volume khung 15m/1h) - cấu trúc MIRROR (phỏng theo) hệ 1m ở trên nhưng
+// KHÔNG dùng chung BẤT KỲ state/hàm nào (trừ `banCooldownUntil` - lý do đã
+// giải thích ở khai báo state) - lỗi/treo ở hệ này KHÔNG ảnh hưởng gì hệ 1m
+// đang chạy ổn định.
+// ==========================================
+
+async function fetchCandles15mForSymbol(symbol, failures) {
+  try {
+    const response = await axios.get(FUT_KLINES_URL, {
+      params: { symbol, interval: '15m', limit: CANDLE_LIMIT_15M },
+      timeout: 8000,
+    });
+    if (Array.isArray(response.data) && response.data.length > 0) {
+      return response.data;
+    }
+    if (failures) failures.push({ symbol, reason: 'empty_response' });
+    return null;
+  } catch (error) {
+    if (failures) {
+      const status = error.response?.status;
+      const reason = status ? `HTTP_${status}` : error.code || error.message || 'unknown';
+      failures.push({ symbol, reason });
+    }
+    return null;
+  }
+}
+
+async function refreshAllCandles15m() {
+  if (cycleInProgress15m) {
+    console.warn('[Cycle-15m] Chu kỳ trước vẫn đang chạy - bỏ qua lần gọi này.');
+    return;
+  }
+  // Dùng CHUNG cờ "nghỉ vì nghi ngờ ban" với hệ 1m - cùng lý do (chung 1 IP).
+  if (Date.now() < banCooldownUntil) {
+    console.warn(
+      `[Cycle-15m] Đang NGHỈ do nghi ngờ bị Binance ban (còn ${Math.ceil(
+        (banCooldownUntil - Date.now()) / 1000
+      )}s) - bỏ qua.`
+    );
+    return;
+  }
+  if (symbolList.length === 0) return; // hệ 1m tự lo việc tải symbolList - hệ này chỉ ĐỌC, không tự tải riêng
+
+  cycleInProgress15m = true;
+  lastCycleStartedAt15m = Date.now();
+  const CYCLE_WATCHDOG_MS = 90 * 1000; // rộng hơn hệ 1m 1 chút - nến 15m ít symbol xử lý gấp/thường xuyên hơn không cần thiết
+  const failures = [];
+
+  try {
+    await Promise.race([
+      (async () => {
+        for (let i = 0; i < symbolList.length; i += BATCH_SIZE) {
+          const batch = symbolList.slice(i, i + BATCH_SIZE);
+          await Promise.all(
+            batch.map(async (symbol) => {
+              const candles = await fetchCandles15mForSymbol(symbol, failures);
+              if (candles) {
+                candleCache15m.set(symbol, { timestamp: Date.now(), candles });
+              }
+            })
+          );
+          if (i + BATCH_SIZE < symbolList.length) await sleep(BATCH_DELAY_MS);
+        }
+      })(),
+      sleep(CYCLE_WATCHDOG_MS).then(() => {
+        throw new Error(`CYCLE_WATCHDOG_TIMEOUT_15M sau ${CYCLE_WATCHDOG_MS}ms`);
+      }),
+    ]);
+    lastCycleFinishedAt15m = Date.now();
+    const failSummary = failures.length === 0 ? '' : ` | ${failures.length} symbol lỗi`;
+    console.log(
+      `[Cycle-15m] Xong - ${candleCache15m.size}/${symbolList.length} symbol có cache, mất ${
+        lastCycleFinishedAt15m - lastCycleStartedAt15m
+      }ms${failSummary}`
+    );
+    // KHÔNG tự set `banCooldownUntil` ở đây - hệ 1m (chạy thường xuyên hơn,
+    // 90s so với 3 phút) đã đảm nhiệm việc PHÁT HIỆN + kích hoạt nghỉ chung
+    // rồi, hệ này CHỈ cần ĐỌC/tôn trọng cờ đó (dòng kiểm tra ở đầu hàm) -
+    // tránh trùng lặp logic phát hiện ban ở 2 nơi.
+  } catch (e) {
+    console.error(
+      `[Cycle-15m] LỖI/TREO giữa chừng: ${e.message} - đã có ${candleCache15m.size}/${symbolList.length} symbol trong cache trước đó (giữ nguyên).`
+    );
+  } finally {
+    cycleInProgress15m = false;
+  }
+}
+
+// ==========================================
+
 // 5. SUY RA GIÁ TẠI 1 MỐC LÙI (phút) TỪ CACHE NẾN CỦA 1 SYMBOL - THAY VÌ
 // GỌI BINANCE RIÊNG CHO TỪNG KHUNG.
 // ==========================================
@@ -644,6 +765,41 @@ const server = http.createServer(async (req, res) => {
     );
   }
 
+  // ---- /api/recent_volumes_15m?count=140 - MỚI: y hệt `/api/recent_volumes`
+  // ở trên nhưng ĐỌC TỪ `candleCache15m` (RIÊNG BIỆT hoàn toàn, KHÔNG chung
+  // gì với `candleCache` 1 phút) - phục vụ RIÊNG `market_watcher.js` phát
+  // hiện nổ volume khung 15m VÀ khung 1h (ghép 4 nến 15m liên tiếp thành 1
+  // "nến 1h" phía `market_watcher.js`, KHÔNG cần cache 1h riêng).
+  if (pathname === '/api/recent_volumes_15m') {
+    const rawCount = parseInt(query.count, 10);
+    const count = Number.isFinite(rawCount) ? Math.min(Math.max(rawCount, 5), CANDLE_LIMIT_15M) : 140;
+
+    const now = Date.now();
+    const STALE_SYMBOL_MS = 20 * 60 * 1000; // rộng hơn hệ 1m - chu kỳ refresh 15m thưa hơn (3 phút)
+    const volumes = {};
+    for (const [symbol, cached] of candleCache15m.entries()) {
+      if (now - cached.timestamp > STALE_SYMBOL_MS) continue;
+      const candles = cached.candles;
+      if (!candles || candles.length < 2) continue;
+      const recent = candles.slice(-count);
+      const arr = recent.map((c) => parseFloat(c[7])).filter((v) => !Number.isNaN(v));
+      if (arr.length >= 2) volumes[symbol] = arr;
+    }
+
+    res.writeHead(200);
+    return res.end(
+      JSON.stringify(
+        packResponse({
+          status: 'success',
+          count,
+          symbolCount: Object.keys(volumes).length,
+          lastCycleFinishedAtMs: lastCycleFinishedAt15m,
+          volumes,
+        })
+      )
+    );
+  }
+
   // ---- /api/market-caps - TOÀN BỘ market cap (đã gộp từ server riêng
   // trước đây) - dùng khi FLUTTER cần tự so khớp/xử lý prefix Futures
   // (1000/10000/1000000...) phía client, đỡ phải gọi lẻ từng coin. ----
@@ -760,6 +916,14 @@ async function start() {
   // Chu kỳ ĐẦU TIÊN chạy ngay (không đợi đủ 90s mới có data lần đầu).
   refreshAllCandles();
   setInterval(refreshAllCandles, REFRESH_INTERVAL_MS);
+
+  // MỚI: hệ 15m RIÊNG (xem giải thích đầy đủ ở khai báo
+  // `CANDLE_LIMIT_15M`/`refreshAllCandles15m`) - CHỜ symbolList tải xong ở
+  // TRÊN rồi mới bắt đầu (hàm tự kiểm tra `symbolList.length === 0` nên gọi
+  // sớm vẫn AN TOÀN, không lỗi gì - chỉ đơn giản chưa làm được gì cho tới
+  // khi symbolList sẵn sàng).
+  refreshAllCandles15m();
+  setInterval(refreshAllCandles15m, REFRESH_INTERVAL_15M_MS);
 
   // MỚI: market cap - chu kỳ ĐẦU TIÊN chạy ngay (fire-and-forget, KHÔNG
   // `await` - không lý do gì chặn `start()`/cổng HTTP chờ vòng cào CoinGecko
